@@ -18,7 +18,7 @@ A new section is added at the end of every step.
 | 7 | Period close & immutable invoice | ✅ Done |
 | 8 | Spring Security + JWT (OAuth2 resource server, writer/reader roles) | ✅ Done |
 | 9 | OpenAPI docs + tests (JUnit 5, Mockito, Testcontainers) | ✅ Done |
-| 10 | Dockerfile (app + Postgres in compose) + GitHub Actions CI + README badge | |
+| 10 | Dockerfile (app + Postgres in compose) + GitHub Actions CI + README badge | ✅ Done |
 | 11 | React + TypeScript portal (Vite, React Query) | |
 
 ---
@@ -87,6 +87,10 @@ A new section is added at the end of every step.
 | `config/OpenApiConfig.java` | Step 9 | API title/description + "Authorize" (bearer JWT) button in Swagger UI |
 | `src/test/java/com/meterly/service/UsageIngestionTest.java` | Step 9 | Mockito unit test of the retry logic |
 | `src/test/java/com/meterly/security/AccountAccessTest.java` | Step 9 | Unit test of the row-level access rule |
+| `Dockerfile` | Step 10 | Multi-stage build: Maven builds the jar, a small JRE image runs it |
+| `.dockerignore` | Step 10 | Keeps `target/`, `portal/`, `.git` etc. out of the Docker build |
+| `compose.yaml` | Step 2, 10 | Now also has a Postgres healthcheck and an `app` service (profile `app`) |
+| `.github/workflows/ci.yml` | Step 10 | GitHub Actions: build + all tests on every push/PR, then build the Docker image |
 
 ---
 
@@ -706,3 +710,67 @@ indexes, `FOR SHARE` locks, plpgsql triggers, `TIMESTAMPTZ`. Testcontainers runs
 - **Unit vs integration test?** A unit test checks one class in isolation (dependencies mocked); an integration test checks real collaboration (Spring + DB + HTTP).
 - **When not to mock?** Don't mock what you're testing, or things you don't own like the database: test those with the real thing (Testcontainers).
 - **What is OpenAPI?** A standard, machine-readable description of a REST API (paths, parameters, schemas, auth). Swagger UI is one viewer for it.
+
+---
+
+## Step 10 — Dockerfile, Compose (app + Postgres), GitHub Actions CI
+
+**Goal:** anyone can run the whole system with one command, and every push is built and tested automatically.
+
+### How it was added
+1. `Dockerfile` (multi-stage) + `.dockerignore`.
+2. `compose.yaml`: Postgres healthcheck + an `app` service in the `app` profile.
+3. `pom.xml`: `spring-boot-starter-actuator` → `/actuator/health`.
+4. `.github/workflows/ci.yml` + CI badge in `README.md`.
+5. `git update-index --chmod=+x mvnw`: marks the wrapper executable for Linux.
+
+### Commands
+
+| Command | What it does |
+|---------|--------------|
+| `docker compose up -d` | Database only (for development with `.\mvnw spring-boot:run`) |
+| `docker compose --profile app up -d --build` | Builds the image and runs **app + database** |
+| `docker compose logs -f app` | Follow the app's log |
+| `docker compose --profile app down` | Stop everything (data stays in the volume) |
+| `docker build -t meterly .` | Build only the image |
+
+### Dockerfile explained
+
+| Line | Meaning |
+|------|---------|
+| `FROM maven:3.9-eclipse-temurin-21 AS build` | Stage 1, named `build`: an image that has Maven + JDK 21 |
+| `COPY pom.xml .` then `RUN mvn dependency:go-offline` | Download dependencies in their **own layer**: cached until `pom.xml` changes, so code changes rebuild fast |
+| `RUN mvn package -DskipTests` | Build the jar (tests already ran in CI) |
+| `FROM eclipse-temurin:21-jre` | Stage 2: only a Java **runtime**. The JDK, Maven and source code aren't in the final image (smaller, safer) |
+| `COPY --from=build ... app.jar` | Take just the jar from stage 1 |
+| `useradd` + `USER meterly` | Don't run as root: limits the damage if the app is ever compromised |
+| `ENTRYPOINT ["java","-jar","app.jar"]` | The command the container runs |
+
+### Compose explained
+
+| Setting | Meaning |
+|---------|---------|
+| `healthcheck: pg_isready` | Postgres reports "healthy" only once it accepts connections |
+| `depends_on: condition: service_healthy` | The app waits for a **healthy** DB, not just a started container |
+| `SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/...` | Env vars override `application.properties` (relaxed binding). Inside Docker's network the host is the **service name** |
+| `profiles: ["app"]` | The service only starts when that profile is requested |
+| `${METERLY_JWT_SECRET:-default}` | Take the secret from your shell/`.env` file, else the dev default |
+
+### CI workflow explained
+
+| Part | Meaning |
+|------|---------|
+| `on: push (main)`, `pull_request` | When it runs |
+| `runs-on: ubuntu-latest` | A fresh Linux VM from GitHub; it has Docker, so **Testcontainers tests really run** |
+| `actions/setup-java` with `cache: maven` | Installs JDK 21 and caches `~/.m2` between runs |
+| `./mvnw -B verify` | Compile + all tests (`-B` = batch mode, cleaner logs) |
+| `upload-artifact` `if: failure()` | When tests fail, keep the reports for download |
+| `docker` job with `needs: backend` | Builds the image only after the tests pass |
+
+The badge at the top of the README shows green/red for the latest run on `main`.
+
+### Interview Q&A
+- **Why multi-stage builds?** The build tools stay out of the runtime image: it's smaller, has a smaller attack surface and no source code.
+- **Why order Dockerfile lines carefully?** Each instruction is a cached layer; put rarely-changing steps (dependencies) before often-changing ones (code).
+- **What does CI give you?** Every change is built and tested the same way on a clean machine; "works on my machine" problems show up immediately.
+- **How does config change between environments?** The same image everywhere; only environment variables differ (12-factor app).

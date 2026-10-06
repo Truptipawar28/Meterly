@@ -10,6 +10,29 @@ services:
       - "5432:5432"
     volumes:
       - meterly-data:/var/lib/postgresql/data
+    # "healthy" only once PostgreSQL actually accepts connections
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meterly -d meterly"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # The app itself. In the "app" profile so that plain "docker compose up -d" still starts
+  # only the database (for development with .\mvnw spring-boot:run).
+  # Everything in Docker:  docker compose --profile app up -d --build
+  app:
+    build: .
+    container_name: meterly-app
+    profiles: ["app"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Inside Docker's network the database host is the service name "postgres", not localhost
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/meterly
+      METERLY_JWT_SECRET: ${METERLY_JWT_SECRET:-dev-only-secret-change-me-0123456789abcdef}
+    ports:
+      - "9091:9091"
 
 volumes:
   meterly-data:

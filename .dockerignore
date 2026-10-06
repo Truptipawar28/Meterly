@@ -1,0 +1,9 @@
+# Files Docker should NOT send into the build (faster builds, no secrets/junk in the image)
+target/
+portal/
+.git/
+.github/
+.idea/
+.vscode/
+docs/
+*.md

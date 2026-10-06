@@ -34,6 +34,12 @@
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
 
+        <!-- Actuator: /actuator/health for Docker, load balancers and monitoring -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
         <!-- Bean Validation: @NotBlank, @Positive ... on request bodies -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
