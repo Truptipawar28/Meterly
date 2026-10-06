@@ -19,7 +19,7 @@ A new section is added at the end of every step.
 | 8 | Spring Security + JWT (OAuth2 resource server, writer/reader roles) | ✅ Done |
 | 9 | OpenAPI docs + tests (JUnit 5, Mockito, Testcontainers) | ✅ Done |
 | 10 | Dockerfile (app + Postgres in compose) + GitHub Actions CI + README badge | ✅ Done |
-| 11 | React + TypeScript portal (Vite, React Query) | |
+| 11 | React + TypeScript portal (Vite, React Query) | ✅ Done |
 
 ---
 
@@ -90,7 +90,19 @@ A new section is added at the end of every step.
 | `Dockerfile` | Step 10 | Multi-stage build: Maven builds the jar, a small JRE image runs it |
 | `.dockerignore` | Step 10 | Keeps `target/`, `portal/`, `.git` etc. out of the Docker build |
 | `compose.yaml` | Step 2, 10 | Now also has a Postgres healthcheck and an `app` service (profile `app`) |
-| `.github/workflows/ci.yml` | Step 10 | GitHub Actions: build + all tests on every push/PR, then build the Docker image |
+| `.github/workflows/ci.yml` | Step 10–11 | GitHub Actions: backend tests, portal build, Docker image |
+| `portal/package.json`, `package-lock.json` | Step 11 | npm dependencies + scripts (`dev`, `build`); the lock file pins exact versions |
+| `portal/vite.config.ts` | Step 11 | Vite dev server on :5173, proxies `/api` to :9091 |
+| `portal/tsconfig.json` | Step 11 | TypeScript settings (strict mode) |
+| `portal/index.html` | Step 11 | The single HTML page React renders into |
+| `portal/src/main.tsx` | Step 11 | Entry point: React Query client + auth provider + App |
+| `portal/src/api.ts` | Step 11 | Typed fetch client and TS types mirroring the Java DTOs |
+| `portal/src/auth.tsx` | Step 11 | Login state (JWT in sessionStorage), `useAuth` hook |
+| `portal/src/App.tsx` | Step 11 | Layout, tabs, account picker for admins |
+| `portal/src/components/Login.tsx` | Step 11 | Login form with demo users |
+| `portal/src/components/Dashboard.tsx` | Step 11 | Live cost tiles + breakdown tree; admin actions |
+| `portal/src/components/Invoices.tsx` | Step 11 | Invoice list + detail |
+| `portal/src/format.ts`, `styles.css` | Step 11 | Money/date formatting; styling (light + dark) |
 
 ---
 
@@ -774,3 +786,73 @@ The badge at the top of the README shows green/red for the latest run on `main`.
 - **Why order Dockerfile lines carefully?** Each instruction is a cached layer; put rarely-changing steps (dependencies) before often-changing ones (code).
 - **What does CI give you?** Every change is built and tested the same way on a clean machine; "works on my machine" problems show up immediately.
 - **How does config change between environments?** The same image everywhere; only environment variables differ (12-factor app).
+
+---
+
+## Step 11 — React + TypeScript portal (Vite, React Query)
+
+**Goal:** a thin billing portal: customers see live usage cost and invoices; operators can switch accounts, simulate usage and close periods.
+
+### How it was added
+1. `portal/` folder with `package.json`, `tsconfig.json`, `vite.config.ts`, `index.html` (written by hand; `npm create vite` would generate the same).
+2. `npm install`: downloads packages into `portal/node_modules` (git-ignored) and writes `package-lock.json` (committed).
+3. Source files in `portal/src/`.
+4. CI: a `portal` job runs `npm ci` + `npm run build`.
+
+### Run it
+```bash
+# backend running on :9091 first (docker compose up -d; .\mvnw spring-boot:run)
+cd portal
+npm install        # first time only
+npm run dev        # → http://localhost:5173
+```
+Log in as `client/client123` (customer view of Acme Corp) or `admin/admin123` (all accounts + actions).
+
+### How the pieces fit
+
+| File | Role |
+|------|------|
+| `main.tsx` | Creates the `QueryClient`, wraps the app in `QueryClientProvider` + `AuthProvider` |
+| `auth.tsx` | React **context**: keeps the session (token, roles, accountId) and offers `login` / `logout` |
+| `api.ts` | One `request()` helper: adds `Authorization: Bearer …`, turns error JSON into `ApiError`, logs out on 401 |
+| `App.tsx` | Not logged in → `<Login/>`; otherwise header + tabs; admins get an account `<select>` |
+| `Dashboard.tsx` | `useQuery(['cost', id])` with `refetchInterval: 10_000` → a "live" dashboard |
+| `Invoices.tsx` | List + detail; detail uses `staleTime: Infinity` because invoices never change |
+
+### React Query in 4 ideas
+
+| Code | Meaning |
+|------|---------|
+| `useQuery({ queryKey: ['cost', accountId], queryFn })` | Fetch + cache by key; gives `data`, `isLoading`, `isError`. Same key elsewhere = no second request |
+| `refetchInterval: 10_000` | Poll every 10 s, so new usage appears automatically |
+| `useMutation({ mutationFn, onSuccess })` | For POSTs (record usage, close period) |
+| `queryClient.invalidateQueries({ queryKey: ['cost', id] })` | "This data is outdated": refetch it now (after a mutation) |
+
+### Other key code
+
+| Code | Meaning |
+|------|---------|
+| `interface CostReport { … }` | TypeScript type matching the Java `CostReport` record; the compiler catches typos like `report.amountdue` |
+| `vite.config.ts` → `proxy: { '/api': 'http://localhost:9091' }` | The browser only talks to :5173; Vite forwards API calls → **no CORS** setup needed |
+| `crypto.randomUUID()` as `Idempotency-Key` | A unique key per click; a network retry of the *same* request would reuse it |
+| `sessionStorage` for the token | Gone when the tab closes. Trade-off: readable by page JavaScript (XSS risk). In production prefer short-lived tokens or an httpOnly cookie via a backend-for-frontend |
+| `npm ci` (CI) vs `npm install` (dev) | `ci` installs exactly what `package-lock.json` says and fails if it's out of sync, so builds are reproducible |
+
+### Interview Q&A
+- **Why React Query instead of `useEffect` + `useState`?** Caching, deduplication, background refetching, loading/error states and invalidation come built in, so there's far less hand-written state code.
+- **Why no Redux?** Almost all state here is *server state*, which React Query owns. The tiny bit of client state (session, selected tab) fits in context/`useState`.
+- **How does the portal stay secure if the UI hides buttons?** It doesn't rely on the UI: the backend enforces roles and account ownership on every request. Hiding buttons is only UX.
+
+---
+
+## Whole-project cheat sheet
+
+| I want to… | Command |
+|------------|---------|
+| Start the database | `docker compose up -d` |
+| Run the backend | `.\mvnw spring-boot:run` → http://localhost:9091 |
+| Open the API docs | http://localhost:9091/swagger-ui.html |
+| Run the portal | `cd portal; npm run dev` → http://localhost:5173 |
+| Run everything in Docker (no portal) | `docker compose --profile app up -d --build` |
+| Run all tests | `.\mvnw test` (integration tests need Docker running) |
+| Reset the database (deletes all data) | `docker compose down -v` then `docker compose up -d` |
