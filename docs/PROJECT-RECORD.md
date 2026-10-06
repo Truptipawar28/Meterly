@@ -17,7 +17,7 @@ A new section is added at the end of every step.
 | 6 | Cost aggregation endpoint → service → account | ✅ Done |
 | 7 | Period close & immutable invoice | ✅ Done |
 | 8 | Spring Security + JWT (OAuth2 resource server, writer/reader roles) | ✅ Done |
-| 9 | OpenAPI docs + tests (JUnit 5, Mockito, Testcontainers) | |
+| 9 | OpenAPI docs + tests (JUnit 5, Mockito, Testcontainers) | ✅ Done |
 | 10 | Dockerfile (app + Postgres in compose) + GitHub Actions CI + README badge | |
 | 11 | React + TypeScript portal (Vite, React Query) | |
 
@@ -84,6 +84,9 @@ A new section is added at the end of every step.
 | `api/AuthController.java` | Step 8 | `POST /api/auth/token` (dev login), `GET /api/me` |
 | `config/DemoDataLoader.java` | Step 8 | Fills an empty DB with sample accounts, usage and one invoice |
 | `src/test/java/com/meterly/api/SecurityAndApiTest.java` | Step 8 | HTTP tests: 401/403, row-level access, idempotent replay |
+| `config/OpenApiConfig.java` | Step 9 | API title/description + "Authorize" (bearer JWT) button in Swagger UI |
+| `src/test/java/com/meterly/service/UsageIngestionTest.java` | Step 9 | Mockito unit test of the retry logic |
+| `src/test/java/com/meterly/security/AccountAccessTest.java` | Step 9 | Unit test of the row-level access rule |
 
 ---
 
@@ -653,3 +656,53 @@ Authorization: Bearer <jwt>
 - **HS256 vs RS256?** HS256: one shared secret signs and verifies. RS256: a private key signs, a public key verifies, so many services can verify without being able to issue tokens.
 - **How do you revoke a JWT?** Short lifetimes + refresh tokens, or a deny-list. Stateless tokens can't simply be "logged out".
 - **URL rules vs `@PreAuthorize`?** URL rules for coarse role checks; method security for data-dependent rules (whose account is it?).
+
+---
+
+## Step 9 — OpenAPI docs + tests (JUnit 5, Mockito, Testcontainers)
+
+**Goal:** live API documentation generated from the code, and a test suite at three levels.
+
+### How it was added
+1. `pom.xml`: `springdoc-openapi-starter-webmvc-ui` 2.8.17 (the 2.8 line is for Spring Boot 3.x).
+2. `OpenApiConfig`: title, description, JWT "Authorize" button.
+3. `@Operation` / `@Parameter` on `POST /api/usage` for richer docs.
+4. Mockito unit test (`UsageIngestionTest`) + access rule test (`AccountAccessTest`).
+5. Surefire loads Mockito as a Java agent (removes a JDK warning).
+
+### Swagger UI
+Open **http://localhost:9091/swagger-ui.html** → `POST /api/auth/token` → "Try it out" → copy `accessToken`
+→ **Authorize** (top right) → paste → now every "Try it out" call sends the token.
+The raw spec (JSON) is at `/v3/api-docs`; tools can generate clients from it.
+
+### The test pyramid in this project
+
+| Level | Tests | Tools | Speed | Needs Docker |
+|-------|-------|-------|-------|--------------|
+| Unit (pure logic) | `CostCalculatorTest`, `AccountAccessTest` | JUnit 5 + AssertJ | ms | No |
+| Unit with mocks | `UsageIngestionTest` | Mockito | ms | No |
+| Integration (service + real DB) | `ConcurrentUsageTest`, `InvoiceFlowTest` | `@SpringBootTest` + Testcontainers | seconds | Yes |
+| API over HTTP | `SecurityAndApiTest` | `TestRestTemplate` + random port | seconds | Yes |
+
+Run all: `.\mvnw test`. Without Docker, the integration tests are **skipped** (not failed).
+
+### Mockito in 4 lines
+
+| Code | Meaning |
+|------|---------|
+| `@ExtendWith(MockitoExtension.class)` + `@Mock UsageService usageService` | Creates a fake `UsageService` with no real behaviour |
+| `when(mock.record(...)).thenThrow(x).thenReturn(y)` | Script it: 1st call throws, 2nd returns |
+| `verify(mock, times(2)).record(...)` | Assert how often it was called |
+| `mock(UsageEvent.class)` | A dummy object when only its identity matters |
+
+**Why mock here?** A real optimistic-lock conflict is hard to trigger on demand; a mock produces one every time, so each
+retry branch (conflict → retry, duplicate key → replay, counter race → retry, give up → 409) gets its own deterministic test.
+
+### Why Testcontainers and not H2?
+H2 is an in-memory database that only *imitates* PostgreSQL. Our code relies on real PostgreSQL behaviour: partial unique
+indexes, `FOR SHARE` locks, plpgsql triggers, `TIMESTAMPTZ`. Testcontainers runs the **same** `postgres:17` image as production.
+
+### Interview Q&A
+- **Unit vs integration test?** A unit test checks one class in isolation (dependencies mocked); an integration test checks real collaboration (Spring + DB + HTTP).
+- **When not to mock?** Don't mock what you're testing, or things you don't own like the database: test those with the real thing (Testcontainers).
+- **What is OpenAPI?** A standard, machine-readable description of a REST API (paths, parameters, schemas, auth). Swagger UI is one viewer for it.

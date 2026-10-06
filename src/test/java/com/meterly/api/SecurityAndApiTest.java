@@ -36,6 +36,13 @@ class SecurityAndApiTest extends IntegrationTest {
     }
 
     @Test
+    void openApiDocsArePublic() {
+        var docs = http.getForEntity("/v3/api-docs", String.class);
+        assertThat(docs.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(docs.getBody()).contains("Meterly API", "/api/usage", "bearerAuth");
+    }
+
+    @Test
     void loginIssuesATokenForValidDemoUsersOnly() {
         var bad = http.postForEntity("/api/auth/token", Map.of("username", "admin", "password", "nope"), String.class);
         assertThat(bad.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);

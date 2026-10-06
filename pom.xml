@@ -23,6 +23,8 @@
         <java.version>21</java.version>
         <!-- Newer than Boot's default: works with recent Docker Engine API versions -->
         <testcontainers.version>1.21.4</testcontainers.version>
+        <!-- Empty default so @{argLine} in surefire works when no other plugin sets it -->
+        <argLine></argLine>
     </properties>
 
     <dependencies>
@@ -46,6 +48,13 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+        </dependency>
+
+        <!-- OpenAPI 3 spec generated from the code + Swagger UI at /swagger-ui.html -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>2.8.17</version>
         </dependency>
 
         <!-- JPA (Hibernate): map Java classes to database tables -->
@@ -108,6 +117,26 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!-- Load Mockito as a Java agent for tests (newer JDKs warn about runtime self-attaching) -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>properties</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <argLine>@{argLine} -javaagent:${org.mockito:mockito-core:jar} -Xshare:off</argLine>
+                </configuration>
             </plugin>
         </plugins>
     </build>

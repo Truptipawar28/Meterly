@@ -13,6 +13,8 @@ import com.meterly.api.dto.UsageDtos.UsageResponse;
 import com.meterly.service.UsageIngestion;
 import com.meterly.service.UsageService.Recorded;
 
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
 import jakarta.validation.Valid;
 
 @RestController
@@ -32,7 +34,12 @@ public class UsageController {
      * 201 Created = stored now; 200 OK + "Idempotent-Replayed: true" = already stored earlier, not counted again.
      */
     @PostMapping
-    public ResponseEntity<UsageResponse> record(@RequestHeader(IDEMPOTENCY_KEY) String idempotencyKey,
+    @Operation(summary = "Record usage (role WRITER)",
+            description = "201 = stored. 200 + Idempotent-Replayed: true = same key seen before, not counted again. "
+                    + "422 = key reused with a different body.")
+    public ResponseEntity<UsageResponse> record(
+            @Parameter(description = "Unique per logical event; reuse it when retrying", example = "evt-2026-10-07-0001")
+            @RequestHeader(IDEMPOTENCY_KEY) String idempotencyKey,
                                                 @Valid @RequestBody UsageRequest request) {
         if (idempotencyKey.isBlank() || idempotencyKey.length() > 100) {
             throw new ApiException(HttpStatus.BAD_REQUEST, "Idempotency-Key must be 1-100 characters");
