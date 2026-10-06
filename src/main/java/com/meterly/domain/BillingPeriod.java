@@ -55,6 +55,9 @@ public class BillingPeriod {
     }
 
     public void close() {
+        if (status == PeriodStatus.CLOSED) {
+            throw new IllegalStateException("Billing period " + id + " is already closed");
+        }
         this.status = PeriodStatus.CLOSED;
     }
 

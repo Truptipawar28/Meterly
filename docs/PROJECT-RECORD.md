@@ -15,7 +15,7 @@ A new section is added at the end of every step.
 | 4 | Usage ingestion API + Idempotency-Key | ✅ Done |
 | 5 | Concurrency: `@Version`, retries, multi-thread test | ✅ Done |
 | 6 | Cost aggregation endpoint → service → account | ✅ Done |
-| 7 | Period close & immutable invoice | |
+| 7 | Period close & immutable invoice | ✅ Done |
 | 8 | Spring Security + JWT (OAuth2 resource server, writer/reader roles) | |
 | 9 | OpenAPI docs + tests (JUnit 5, Mockito, Testcontainers) | |
 | 10 | Dockerfile (app + Postgres in compose) + GitHub Actions CI + README badge | |
@@ -70,6 +70,13 @@ A new section is added at the end of every step.
 | `service/cost/CostService.java` | Step 6 | Loads data for a report; reconciliation of counters vs events |
 | `api/CostController.java` | Step 6 | REST: current cost, cost per period, reconcile |
 | `src/test/java/com/meterly/service/cost/CostCalculatorTest.java` | Step 6 | Unit tests for the cost math (no Spring, no DB) |
+| `src/main/resources/db/migration/V3__invoices.sql` | Step 7 | Tables `invoice` + `invoice_line`, triggers that forbid UPDATE/DELETE |
+| `domain/Invoice.java`, `domain/InvoiceLine.java` | Step 7 | `@Immutable` entities; `Invoice.issue(...)` freezes a cost report |
+| `repository/InvoiceRepository.java` | Step 7 | Load an invoice with its lines; list invoices of an account |
+| `service/InvoiceService.java` | Step 7 | Close period → invoice → open next period, in one transaction |
+| `api/dto/InvoiceDtos.java` | Step 7 | Invoice summary / detail response records |
+| `api/InvoiceController.java` | Step 7 | REST: close period, list invoices, get invoice |
+| `src/test/java/com/meterly/service/InvoiceFlowTest.java` | Step 7 | Integration test: close flow, immutability via raw SQL |
 
 ---
 
@@ -501,3 +508,60 @@ behind. (The invoice in Step 7 *does* store a snapshot, because an invoice must 
 - **What is HALF_EVEN?** Banker's rounding: .5 goes to the nearest even digit, so over many values the rounding errors cancel out.
 - **Why a pure calculator class?** Business rules can be tested in milliseconds without a database; the service only does I/O.
 - **What is reconciliation?** An independent check that two representations of the same data (counters vs events) agree.
+
+---
+
+## Step 7 — Period close & immutable invoice
+
+**Goal:** at month end, freeze the period's cost into an invoice that can never change, and start the next period.
+
+### How it was added
+1. `V3__invoices.sql`: `invoice` + `invoice_line` tables and two **triggers** that reject UPDATE/DELETE.
+2. Entities `Invoice` / `InvoiceLine` with Hibernate's `@Immutable`.
+3. `InvoiceService.closePeriod`, `InvoiceController`, response DTOs.
+4. `BillingPeriod.close()` now refuses to close twice.
+
+### Endpoints
+
+| Method + URL | What it does |
+|--------------|--------------|
+| `POST /api/accounts/{id}/close-period` | Close the open period → **201** + the invoice |
+| `GET /api/accounts/{id}/invoices` | List invoices (summary) |
+| `GET /api/invoices/{id}` | Invoice with all lines |
+
+### The close, step by step (one transaction)
+
+| # | Code | Why |
+|---|------|-----|
+| 1 | `findOpenForClose` → `SELECT … FOR UPDATE` | Waits for in-flight usage writes, blocks new ones: nothing slips in after the total is computed |
+| 2 | `costs.report(period)` | Same calculator as the live cost (Step 6) |
+| 3 | `period.close(); saveAndFlush(period)` | Flush **now**: Hibernate runs INSERTs before UPDATEs at commit, so the new OPEN period would break the "one open period" index |
+| 4 | `Invoice.issue(period, report)` + `save` | Snapshot: copies names, unit prices, amounts |
+| 5 | `new BillingPeriod(...next month...)` | Usage keeps flowing into the new period |
+
+If anything fails, **everything** rolls back: no half-closed period, and no period without an invoice.
+
+### Immutability: three layers
+
+| Layer | How |
+|-------|-----|
+| Java | No setters; the only way to create one is `Invoice.issue(...)`; `getLines()` returns an unmodifiable list |
+| Hibernate | `@Immutable`: changes to the object are ignored, no UPDATE is ever generated |
+| PostgreSQL | `BEFORE UPDATE OR DELETE` trigger → `RAISE EXCEPTION`, even from psql or another app |
+
+**Why a snapshot?** If the invoice only referenced `metric_price`, a price change next year would silently change last year's invoice.
+
+### Key code
+
+| Code | Meaning |
+|------|---------|
+| `@OneToMany(mappedBy = "invoice", cascade = CascadeType.PERSIST)` | Invoice → many lines; the FK lives in `invoice_line.invoice_id` (`mappedBy` points to that field); saving the invoice saves its lines |
+| `@OrderBy("id")` | Lines always load in insertion order |
+| `left join fetch i.lines` | Load invoice + lines in one query (avoids LazyInitializationException, since `open-in-view=false`) |
+| `select distinct i` | The join returns one row per line; `distinct` gives one Invoice object |
+| `CREATE FUNCTION … LANGUAGE plpgsql` | A small function stored in PostgreSQL; `TG_TABLE_NAME` / `TG_OP` say which table and operation fired it |
+
+### Interview Q&A
+- **How do you make data immutable?** In several layers: the API (no update endpoint), the domain (no setters), the ORM (`@Immutable`), the database (triggers/permissions). The DB layer is the one that can't be bypassed.
+- **How do you correct a wrong invoice then?** Issue a **credit note** (a new document with negative amounts), never edit the original. That's standard accounting practice.
+- **What's Hibernate's flush order?** Inserts → updates → collection changes → deletes. When a constraint depends on order, flush explicitly.
