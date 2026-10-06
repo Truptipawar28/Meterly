@@ -22,6 +22,7 @@ import com.meterly.domain.Account;
 import com.meterly.domain.Endpoint;
 import com.meterly.domain.Metric;
 import com.meterly.service.UsageService.Recorded;
+import com.meterly.service.cost.CostService;
 
 /** Many threads hammer the SAME counter row. Totals must still be exact. */
 class ConcurrentUsageTest extends IntegrationTest {
@@ -29,6 +30,7 @@ class ConcurrentUsageTest extends IntegrationTest {
     @Autowired CatalogService catalog;
     @Autowired UsageIngestion ingestion;
     @Autowired JdbcTemplate jdbc;
+    @Autowired CostService costs;
 
     @Test
     void parallelWorkersAreCountedExactlyOnce() throws Exception {
@@ -66,6 +68,11 @@ class ConcurrentUsageTest extends IntegrationTest {
         assertThat(counter.get("event_count")).isEqualTo(expectedEvents);
         // version goes up once per successful update after the insert
         assertThat((Long) counter.get("version")).isEqualTo(expectedEvents - 1);
+
+        // Step 6: running counters and raw events agree
+        Long periodId = jdbc.queryForObject(
+                "select billing_period_id from period_usage where endpoint_id = ?", Long.class, endpoint.getId());
+        assertThat(costs.reconcile(periodId)).isEmpty();
     }
 
     @Test

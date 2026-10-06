@@ -14,7 +14,7 @@ A new section is added at the end of every step.
 | 3 | JPA entities | ✅ Done |
 | 4 | Usage ingestion API + Idempotency-Key | ✅ Done |
 | 5 | Concurrency: `@Version`, retries, multi-thread test | ✅ Done |
-| 6 | Cost aggregation endpoint → service → account | |
+| 6 | Cost aggregation endpoint → service → account | ✅ Done |
 | 7 | Period close & immutable invoice | |
 | 8 | Spring Security + JWT (OAuth2 resource server, writer/reader roles) | |
 | 9 | OpenAPI docs + tests (JUnit 5, Mockito, Testcontainers) | |
@@ -64,6 +64,12 @@ A new section is added at the end of every step.
 | `src/test/java/com/meterly/TestcontainersConfig.java` | Step 5 | Starts PostgreSQL 17 in Docker for tests |
 | `src/test/java/com/meterly/IntegrationTest.java` | Step 5 | Base class for full-app tests (skipped when Docker is off) |
 | `src/test/java/com/meterly/service/ConcurrentUsageTest.java` | Step 5 | Multi-thread test: totals stay exact, duplicate keys stored once |
+| `service/cost/UsageTotal.java` | Step 6 | Row of the GROUP BY query: quantity per endpoint + metric |
+| `service/cost/CostReport.java` | Step 6 | The cost tree returned by the API (account → services → endpoints → lines) |
+| `service/cost/CostCalculator.java` | Step 6 | Pure money math: line amounts, roll-up, allowance, rounding |
+| `service/cost/CostService.java` | Step 6 | Loads data for a report; reconciliation of counters vs events |
+| `api/CostController.java` | Step 6 | REST: current cost, cost per period, reconcile |
+| `src/test/java/com/meterly/service/cost/CostCalculatorTest.java` | Step 6 | Unit tests for the cost math (no Spring, no DB) |
 
 ---
 
@@ -443,3 +449,55 @@ Run: `.\mvnw test` (needs Docker running; otherwise these tests are skipped).
 - **Why retry in a new transaction?** The failed transaction is rolled back and its snapshot is stale; only a fresh one sees the winner's value.
 - **Alternative for counters?** An atomic `UPDATE … SET quantity = quantity + ?` has no read-modify-write and no conflicts. We used `@Version` to learn optimistic locking; the atomic update is often the production choice for pure counters.
 - **Why is the double-send test important?** It proves idempotency and concurrency control work *together*.
+
+---
+
+## Step 6 — Cost aggregation: endpoint → service → account
+
+**Goal:** show what an account owes right now, broken down by service, endpoint and metric.
+
+### How it was added
+1. `UsageEventRepository.sumByEndpointAndMetric`: one `GROUP BY` query over the raw events.
+2. New package `service/cost/`: `UsageTotal` (query row), `CostReport` (result tree), `CostCalculator` (math), `CostService` (loading).
+3. `CostController` with 3 endpoints.
+4. `CostCalculatorTest`: first pure unit test.
+
+### Endpoints
+
+| Method + URL | Returns |
+|--------------|---------|
+| `GET /api/accounts/{id}/cost` | Cost tree of the current OPEN period |
+| `GET /api/periods/{id}/cost` | Cost tree of any period |
+| `GET /api/periods/{id}/reconcile` | Counters (`period_usage`) vs events: `[]` = consistent |
+
+### How the cost is computed
+```
+usage_event rows ──GROUP BY endpoint, metric──▶ UsageTotal rows (SQL does this)
+UsageTotal × metric_price.unit_price ─────────▶ LineCost.amount  (exact, 8 decimals)
+sum of lines ─▶ endpoint subtotal ─▶ service subtotal ─▶ usageTotal
+amountDue = max(0, usageTotal − planIncluded) rounded to cents (HALF_EVEN)
+```
+
+**The double-counting trap:** if you computed the service total from events *and* added its endpoints' totals, or summed
+an endpoint row and a service row, every event would count twice. Rule: **compute money only at the leaf, then only add up.**
+
+**Why cost isn't stored:** the price × quantity is derived when needed, so a price fix or a bug fix never leaves stale totals
+behind. (The invoice in Step 7 *does* store a snapshot, because an invoice must never change.)
+
+### Key code
+
+| Code | Meaning |
+|------|---------|
+| `select new com.meterly.service.cost.UsageTotal(...)` | JPQL **constructor expression**: each result row becomes a record directly |
+| `sum(u.quantity) ... group by ...` | Aggregation runs in PostgreSQL, so only a few summary rows travel to Java |
+| `BigDecimal.multiply / add` | Exact decimal math |
+| `setScale(2, RoundingMode.HALF_EVEN)` | Round to cents; ties go to the even digit (0.125 → 0.12, 0.135 → 0.14) to avoid bias |
+| `isEqualByComparingTo("2.50")` | AssertJ: compares BigDecimal by value (`2.5` equals `2.50`); `equals` would also compare scale |
+| `LinkedHashMap` | A map that keeps insertion order, so the report keeps the SQL sort order |
+| `@Component` on `CostCalculator` | It's a Spring bean, but has no dependencies, so tests can just `new` it |
+
+### Interview Q&A
+- **Why round only at the end?** Rounding every line and then summing accumulates errors (many lines of 0.004 would all round to 0.00).
+- **What is HALF_EVEN?** Banker's rounding: .5 goes to the nearest even digit, so over many values the rounding errors cancel out.
+- **Why a pure calculator class?** Business rules can be tested in milliseconds without a database; the service only does I/O.
+- **What is reconciliation?** An independent check that two representations of the same data (counters vs events) agree.
