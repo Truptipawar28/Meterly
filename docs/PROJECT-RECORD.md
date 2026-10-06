@@ -11,8 +11,8 @@ A new section is added at the end of every step.
 |---|------|--------|
 | 1 | Project skeleton | ✅ Done |
 | 2 | PostgreSQL + Flyway + V1 schema (+ HomeController at `/`) | ✅ Done |
-| 3 | JPA entities | ⏳ Code written, waiting for a test run |
-| 4 | Usage ingestion API + Idempotency-Key | |
+| 3 | JPA entities | ✅ Done |
+| 4 | Usage ingestion API + Idempotency-Key | ✅ Done |
 | 5 | Concurrency: `@Version`, retries, multi-thread test | |
 | 6 | Cost aggregation endpoint → service → account | |
 | 7 | Period close & immutable invoice | |
@@ -48,6 +48,16 @@ A new section is added at the end of every step.
 | `src/main/java/com/meterly/repository/*Repository.java` | Step 3 | 6 Spring Data interfaces: save / find / delete for each entity, with no code needed |
 | `mvnw`, `mvnw.cmd` | Step 3 | Maven Wrapper scripts (Linux/Mac and Windows): run Maven without installing it |
 | `.mvn/wrapper/maven-wrapper.properties` | Step 3 | Which Maven version the wrapper downloads (3.9.11) |
+| `.gitattributes` | Step 4 | Forces LF line endings for `mvnw` so it runs on Linux (Docker, CI) |
+| `api/ApiException.java` | Step 4 | Our "expected error" type that carries an HTTP status (404, 409, 422) |
+| `api/ApiExceptionHandler.java` | Step 4 | Converts exceptions into JSON error responses (problem details) |
+| `api/dto/CatalogDtos.java` | Step 4 | Request/response records for accounts, services, endpoints, periods |
+| `api/dto/UsageDtos.java` | Step 4 | Request/response records for usage ingestion |
+| `api/CatalogController.java` | Step 4 | REST: create and list accounts, services, endpoints, periods |
+| `api/UsageController.java` | Step 4 | REST: `POST /api/usage` with the `Idempotency-Key` header |
+| `service/CatalogService.java` | Step 4 | Business logic for the hierarchy; a new account gets an OPEN period |
+| `service/UsageService.java` | Step 4 | Records one usage event in one transaction (idempotency check + insert) |
+| `service/UsageIngestion.java` | Step 4 | Non-transactional wrapper: handles the "two identical requests at once" race |
 
 ---
 
@@ -282,3 +292,76 @@ Add `Optional<BillingPeriod> findByAccountIdAndStatus(Long accountId, PeriodStat
 **Why the Maven Wrapper?** Everyone (you, teammates, GitHub Actions) builds with the *same* Maven version,
 and nobody has to install Maven. That's why Spring Initializr projects always include `mvnw`.
 From now on: use `.\mvnw ...` wherever docs say `mvn ...`.
+
+---
+
+## Step 4 — Usage ingestion API + Idempotency-Key
+
+**Goal:** workers send usage over HTTP; a retried request is **counted once**.
+
+> Paths below are under `src/main/java/com/meterly/`.
+
+### How it was added
+1. `pom.xml`: added `spring-boot-starter-validation` (for `@NotBlank`, `@Positive`, `@Valid`).
+2. New package `api/` (controllers, DTOs, error handling) and `service/` (business logic).
+3. Repository queries added: `findByIdempotencyKey`, `findByAccountIdAndStatus`, `findWithServiceAndAccount` (join fetch)…
+
+### The layers (a request travels top → bottom)
+
+| Layer | Class | Job |
+|-------|-------|-----|
+| Controller | `UsageController` | HTTP only: read header + JSON body, validate, choose status code |
+| Facade | `UsageIngestion` | Not transactional; can react when a transaction fails |
+| Service | `UsageService` | `@Transactional` business logic |
+| Repository | `UsageEventRepository` … | Database access |
+
+### Try it
+```bash
+# create an account (gets an OPEN period automatically), a service, an endpoint
+curl -X POST localhost:9091/api/accounts -H "Content-Type: application/json" -d '{"name":"Acme","planIncluded":5}'
+curl -X POST localhost:9091/api/accounts/1/services -H "Content-Type: application/json" -d '{"name":"search"}'
+curl -X POST localhost:9091/api/services/1/endpoints -H "Content-Type: application/json" -d '{"name":"GET /search"}'
+
+# record usage — run it twice: 1st = 201 Created, 2nd = 200 OK + "Idempotent-Replayed: true"
+curl -i -X POST localhost:9091/api/usage -H "Content-Type: application/json" -H "Idempotency-Key: evt-001" \
+     -d '{"endpointId":1,"metric":"API_CALLS","quantity":100}'
+```
+(From Step 8 on, these calls need a JWT: see Step 8.)
+
+### Idempotency: three layers of protection
+
+| Situation | What happens | Code |
+|-----------|--------------|------|
+| Retry arrives later | `findByIdempotencyKey` finds it → return the old event, **200** + `Idempotent-Replayed: true` | `UsageService.record` step 1 |
+| Two copies arrive **at the same instant** | Both see "not used yet", both INSERT; the `UNIQUE` constraint rejects one → `DataIntegrityViolationException` → the loser looks up the winner's event and returns it | `UsageIngestion.ingest` |
+| Same key, **different** body | Client bug → **422 Unprocessable Entity** | `UsageService.findExisting` |
+
+**Why the database constraint matters:** the "check then insert" in Java has a race window between the check and the insert. Only the database can make "unique" truly unique.
+
+### Key code
+
+| Code | Meaning |
+|------|---------|
+| `@RestController` + `@RequestMapping("/api/usage")` | All methods in this class handle URLs starting with `/api/usage` |
+| `@RequestHeader("Idempotency-Key") String key` | Reads the header; if it's missing, Spring answers 400 automatically |
+| `@Valid @RequestBody UsageRequest request` | JSON → record, then check `@NotNull`/`@Positive`; on failure → 400 with details |
+| `ResponseEntity.status(201).body(...)` | Full control over status code + headers + body |
+| `@Transactional` | Everything in the method commits together or rolls back together |
+| `@Transactional(readOnly = true)` | Hint for reads: Hibernate skips dirty checking |
+| `saveAndFlush(event)` | `save` + send the SQL **now** (normally it's sent at commit), so the UNIQUE error happens inside our try/catch |
+| `join fetch` in `@Query` | Load endpoint + service + account in one SQL query |
+| `record UsageRequest(...)` | Java 16+ immutable data class: constructor, getters (`request.quantity()`), `equals`, `toString` generated |
+| `@RestControllerAdvice` + `@ExceptionHandler` | One central place that turns exceptions into HTTP responses |
+| `ProblemDetail` | Standard JSON error format (RFC 9457): `status`, `title`, `detail` |
+
+### Why `UsageIngestion` is separate from `UsageService`
+When a `@Transactional` method throws, its transaction is marked **rollback-only**: you can't continue
+using it. So the "try again / look up the winner" logic must sit **outside**, in a non-transactional
+bean, and call the service again to get a **fresh** transaction. (Calling a method on the same class
+wouldn't work either: Spring's transaction proxy only intercepts calls coming *from another bean*.)
+
+### Interview Q&A
+- **What is idempotency?** Doing an operation twice has the same effect as doing it once. Needed because networks fail and clients retry.
+- **Why 200 instead of 201 on replay?** Nothing new was created; the client still gets the same body, so a retry is safe.
+- **Why DTOs instead of returning entities?** The API stays stable when tables change, there are no lazy-loading surprises during JSON conversion, and internal fields aren't exposed.
+- **What's the self-invocation problem?** `this.someTransactionalMethod()` bypasses Spring's proxy, so `@Transactional` is ignored.

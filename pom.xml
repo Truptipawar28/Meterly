@@ -30,6 +30,12 @@
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
 
+        <!-- Bean Validation: @NotBlank, @Positive ... on request bodies -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
         <!-- JPA (Hibernate): map Java classes to database tables -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
