@@ -13,7 +13,7 @@ A new section is added at the end of every step.
 | 2 | PostgreSQL + Flyway + V1 schema (+ HomeController at `/`) | ✅ Done |
 | 3 | JPA entities | ✅ Done |
 | 4 | Usage ingestion API + Idempotency-Key | ✅ Done |
-| 5 | Concurrency: `@Version`, retries, multi-thread test | |
+| 5 | Concurrency: `@Version`, retries, multi-thread test | ✅ Done |
 | 6 | Cost aggregation endpoint → service → account | |
 | 7 | Period close & immutable invoice | |
 | 8 | Spring Security + JWT (OAuth2 resource server, writer/reader roles) | |
@@ -57,7 +57,13 @@ A new section is added at the end of every step.
 | `api/UsageController.java` | Step 4 | REST: `POST /api/usage` with the `Idempotency-Key` header |
 | `service/CatalogService.java` | Step 4 | Business logic for the hierarchy; a new account gets an OPEN period |
 | `service/UsageService.java` | Step 4 | Records one usage event in one transaction (idempotency check + insert) |
-| `service/UsageIngestion.java` | Step 4 | Non-transactional wrapper: handles the "two identical requests at once" race |
+| `service/UsageIngestion.java` | Step 4–5 | Non-transactional wrapper: retries on concurrency conflicts, handles duplicate-key races |
+| `src/main/resources/db/migration/V2__period_usage_counters.sql` | Step 5 | New table `period_usage`: running totals with a `version` column |
+| `domain/PeriodUsage.java` | Step 5 | Entity for the running totals, with `@Version` |
+| `repository/PeriodUsageRepository.java` | Step 5 | Find a counter by period + endpoint + metric |
+| `src/test/java/com/meterly/TestcontainersConfig.java` | Step 5 | Starts PostgreSQL 17 in Docker for tests |
+| `src/test/java/com/meterly/IntegrationTest.java` | Step 5 | Base class for full-app tests (skipped when Docker is off) |
+| `src/test/java/com/meterly/service/ConcurrentUsageTest.java` | Step 5 | Multi-thread test: totals stay exact, duplicate keys stored once |
 
 ---
 
@@ -365,3 +371,75 @@ wouldn't work either: Spring's transaction proxy only intercepts calls coming *f
 - **Why 200 instead of 201 on replay?** Nothing new was created; the client still gets the same body, so a retry is safe.
 - **Why DTOs instead of returning entities?** The API stays stable when tables change, there are no lazy-loading surprises during JSON conversion, and internal fields aren't exposed.
 - **What's the self-invocation problem?** `this.someTransactionalMethod()` bypasses Spring's proxy, so `@Transactional` is ignored.
+
+---
+
+## Step 5 — Concurrency: `@Version`, retries, multi-thread test
+
+**Goal:** many workers report usage for the same endpoint at the same moment; totals must stay exact.
+
+### How it was added
+1. `V2__period_usage_counters.sql`: new table `period_usage` (running total per period + endpoint + metric, with `version`).
+2. `PeriodUsage` entity + repository.
+3. `UsageService.record` now also adds to the running total, in the **same transaction** as the event insert.
+4. `UsageIngestion` got a **retry loop**.
+5. `BillingPeriodRepository` got two locking queries (`FOR SHARE` / `FOR UPDATE`).
+6. `pom.xml`: Testcontainers test dependencies; first integration test.
+
+### The problem: lost updates
+```
+Thread A reads quantity = 100      Thread B reads quantity = 100
+Thread A writes 100 + 5 = 105      Thread B writes 100 + 7 = 107   ← A's +5 is lost!
+```
+
+### Solution 1: optimistic locking (`@Version`) + retry — for the hot counter rows
+```sql
+UPDATE period_usage SET quantity = 107, version = 6 WHERE id = 1 AND version = 5;
+-- Thread A already changed version to 6 → 0 rows match → Hibernate throws an exception
+```
+- No locks are held while working, so it's fast when conflicts are rare.
+- On conflict the **whole transaction rolls back** (the event insert too), so event and counter never disagree.
+- `UsageIngestion` catches the exception, waits a random 1–5×attempt ms (**jitter**) and tries again in a **new transaction**: it re-reads the fresh value and adds to it.
+
+### Solution 2: pessimistic locks — between ingestion and closing a period
+
+| Who | Query | Lock | Effect |
+|-----|-------|------|--------|
+| Recording usage | `findOpenForUsage` | `PESSIMISTIC_READ` → `SELECT … FOR SHARE` | Many ingesters at once, no waiting between them |
+| Closing the period (Step 7) | `findOpenForClose` | `PESSIMISTIC_WRITE` → `SELECT … FOR UPDATE` | Waits for running ingesters; new ones wait for the close |
+
+Without it, an event could commit into a period *just after* its invoice was calculated, and that usage would never be billed.
+
+### What gets retried (and why)
+
+| Exception | Cause | Action |
+|-----------|-------|--------|
+| `OptimisticLockingFailureException` | Someone updated the same counter first | Retry |
+| `DataIntegrityViolationException` | UNIQUE race: same Idempotency-Key → return the winner's event; first counter row for endpoint+metric → retry (the row exists now) | Replay or retry |
+| `PessimisticLockingFailureException` | Deadlock/lock timeout reported by PostgreSQL | Retry |
+| After `meterly.usage.max-attempts` (20) | Extreme contention | 409 "please retry" |
+
+### The multi-thread test (`ConcurrentUsageTest`)
+- 8 threads × 25 events, each sent **twice** (retry storm), all on the **same counter row**.
+- A `CountDownLatch` releases all threads at the same instant to maximise collisions.
+- Asserts: 200 events, quantity = 200 × 3, event_count = 200, version = 199.
+- Second test: 10 threads send the **same key** at once → exactly 1 stored, 1 `created=true`.
+
+Run: `.\mvnw test` (needs Docker running; otherwise these tests are skipped).
+
+### Key code
+
+| Code | Meaning |
+|------|---------|
+| `@Version private Long version;` | Hibernate adds `AND version = ?` to UPDATEs and increments it |
+| `@Lock(LockModeType.PESSIMISTIC_READ)` | Adds `FOR SHARE` to the query |
+| `@Value("${meterly.usage.max-attempts:20}")` | Inject a setting from `application.properties` (20 if missing) |
+| `ThreadLocalRandom.current().nextLong(...)` | Random back-off, so threads don't retry in lockstep |
+| `@ServiceConnection` on a container bean | Spring Boot points the datasource at the test container automatically |
+| `@Testcontainers(disabledWithoutDocker = true)` | Skip, instead of failing, when Docker isn't available |
+
+### Interview Q&A
+- **Optimistic vs pessimistic locking?** Optimistic: no lock, detect conflicts at write time (version check), retry. Good when conflicts are rare. Pessimistic: lock the row first (`FOR UPDATE`), others wait. Good when conflicts are common or a retry is expensive.
+- **Why retry in a new transaction?** The failed transaction is rolled back and its snapshot is stale; only a fresh one sees the winner's value.
+- **Alternative for counters?** An atomic `UPDATE … SET quantity = quantity + ?` has no read-modify-write and no conflicts. We used `@Version` to learn optimistic locking; the atomic update is often the production choice for pure counters.
+- **Why is the double-send test important?** It proves idempotency and concurrency control work *together*.
