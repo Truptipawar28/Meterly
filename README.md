@@ -6,7 +6,8 @@ SaaS metered billing & invoicing engine: it takes in usage events from distribut
 ## Run locally
 ```bash
 docker compose up -d      # start PostgreSQL
-mvn spring-boot:run       # start the app
+.\mvnw spring-boot:run    # start the app (Windows; "./mvnw" on Linux/Mac)
 ```
 
+Project record (every file and what it does): [docs/PROJECT-RECORD.md](docs/PROJECT-RECORD.md)
 Learning notes: [docs/Meterly-Learning-Journal.docx](docs/Meterly-Learning-Journal.docx)

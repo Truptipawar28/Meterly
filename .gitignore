@@ -2,3 +2,6 @@ target/
 .idea/
 *.iml
 .vscode/
+
+# AI assistant notes (local only)
+CLAUDE.md
