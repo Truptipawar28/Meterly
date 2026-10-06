@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: meterly-db
+    environment:
+      POSTGRES_DB: meterly
+      POSTGRES_USER: meterly
+      POSTGRES_PASSWORD: meterly
+    ports:
+      - "5432:5432"
+    volumes:
+      - meterly-data:/var/lib/postgresql/data
+
+volumes:
+  meterly-data:
