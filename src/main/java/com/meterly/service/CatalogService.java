@@ -1,7 +1,6 @@
 package com.meterly.service;
 
 import java.math.BigDecimal;
-import java.time.LocalDate;
 import java.time.YearMonth;
 import java.time.ZoneOffset;
 import java.util.List;
@@ -40,9 +39,14 @@ public class CatalogService {
     /** A new account starts with an OPEN billing period for the current month (UTC). */
     @Transactional
     public Account createAccount(String name, BigDecimal planIncluded) {
+        return createAccount(name, planIncluded, YearMonth.now(ZoneOffset.UTC));
+    }
+
+    /** Same, but the first period starts in the given month (demo data uses last month). */
+    @Transactional
+    public Account createAccount(String name, BigDecimal planIncluded, YearMonth firstMonth) {
         Account account = accounts.save(new Account(name, planIncluded == null ? BigDecimal.ZERO : planIncluded));
-        YearMonth month = YearMonth.now(ZoneOffset.UTC);
-        periods.save(new BillingPeriod(account, month.atDay(1), month.atEndOfMonth()));
+        periods.save(new BillingPeriod(account, firstMonth.atDay(1), firstMonth.atEndOfMonth()));
         return account;
     }
 
@@ -86,11 +90,5 @@ public class CatalogService {
     public List<BillingPeriod> listPeriods(Long accountId) {
         getAccount(accountId);
         return periods.findByAccountIdOrderByStartsOnDesc(accountId);
-    }
-
-    /** Used by tests and demo data: a period that starts on a given date. */
-    @Transactional
-    public BillingPeriod openPeriod(Account account, LocalDate startsOn) {
-        return periods.save(new BillingPeriod(account, startsOn, YearMonth.from(startsOn).atEndOfMonth()));
     }
 }

@@ -16,7 +16,7 @@ A new section is added at the end of every step.
 | 5 | Concurrency: `@Version`, retries, multi-thread test | ✅ Done |
 | 6 | Cost aggregation endpoint → service → account | ✅ Done |
 | 7 | Period close & immutable invoice | ✅ Done |
-| 8 | Spring Security + JWT (OAuth2 resource server, writer/reader roles) | |
+| 8 | Spring Security + JWT (OAuth2 resource server, writer/reader roles) | ✅ Done |
 | 9 | OpenAPI docs + tests (JUnit 5, Mockito, Testcontainers) | |
 | 10 | Dockerfile (app + Postgres in compose) + GitHub Actions CI + README badge | |
 | 11 | React + TypeScript portal (Vite, React Query) | |
@@ -77,6 +77,13 @@ A new section is added at the end of every step.
 | `api/dto/InvoiceDtos.java` | Step 7 | Invoice summary / detail response records |
 | `api/InvoiceController.java` | Step 7 | REST: close period, list invoices, get invoice |
 | `src/test/java/com/meterly/service/InvoiceFlowTest.java` | Step 7 | Integration test: close flow, immutability via raw SQL |
+| `security/SecurityConfig.java` | Step 8 | URL rules per role, JWT decoder/encoder, roles claim → Spring authorities |
+| `security/SecurityProperties.java` | Step 8 | Typed `meterly.security.*` settings (secret, token lifetime, demo users) |
+| `security/TokenService.java` | Step 8 | Dev token issuer: checks demo password, signs a JWT |
+| `security/AccountAccess.java` | Step 8 | Row-level rule: a READER sees only the account in their token |
+| `api/AuthController.java` | Step 8 | `POST /api/auth/token` (dev login), `GET /api/me` |
+| `config/DemoDataLoader.java` | Step 8 | Fills an empty DB with sample accounts, usage and one invoice |
+| `src/test/java/com/meterly/api/SecurityAndApiTest.java` | Step 8 | HTTP tests: 401/403, row-level access, idempotent replay |
 
 ---
 
@@ -565,3 +572,84 @@ If anything fails, **everything** rolls back: no half-closed period, and no peri
 - **How do you make data immutable?** In several layers: the API (no update endpoint), the domain (no setters), the ORM (`@Immutable`), the database (triggers/permissions). The DB layer is the one that can't be bypassed.
 - **How do you correct a wrong invoice then?** Issue a **credit note** (a new document with negative amounts), never edit the original. That's standard accounting practice.
 - **What's Hibernate's flush order?** Inserts → updates → collection changes → deletes. When a constraint depends on order, flush explicitly.
+
+---
+
+## Step 8 — Spring Security + JWT (OAuth2 resource server)
+
+**Goal:** every API call must prove who it is. Internal services may **write** usage; customers may only **read** their own account.
+
+### How it was added
+1. `pom.xml`: `spring-boot-starter-security`, `spring-boot-starter-oauth2-resource-server`, `spring-security-test`.
+2. New package `security/`: `SecurityConfig`, `SecurityProperties`, `TokenService`, `AccountAccess`.
+3. `AuthController`: dev login + "who am I".
+4. `@PreAuthorize` / `access.check(...)` added to cost and invoice endpoints.
+5. `application.properties`: JWT secret, token lifetime, demo users.
+6. `DemoDataLoader`: sample data, so the demo `client` user (account 1) has something to see.
+
+### Roles
+
+| Role | Who | Allowed |
+|------|-----|---------|
+| `WRITER` | Internal usage-logging services | `POST /api/usage` |
+| `READER` | A customer's dashboard | `GET` cost / invoices / account **of the account in their token only** |
+| `ADMIN` | Operators | Everything (catalog, close period, reconcile, all accounts) |
+
+Demo logins (dev only): `admin/admin123`, `worker/worker123`, `client/client123` (account 1).
+
+### Try it
+```bash
+# 1. get a token
+curl -X POST localhost:9091/api/auth/token -H "Content-Type: application/json" \
+     -d '{"username":"client","password":"client123"}'
+# → {"accessToken":"eyJhbGciOiJIUzI1NiJ9...","tokenType":"Bearer","expiresIn":28800,...}
+
+# 2. use it
+curl localhost:9091/api/accounts/1/cost -H "Authorization: Bearer eyJhbGciOi..."
+curl localhost:9091/api/accounts/2/cost -H "Authorization: Bearer eyJhbGciOi..."   # → 403
+```
+Paste a token into https://jwt.io to see what's inside (header, claims, signature).
+
+### How a request is checked
+```
+Authorization: Bearer <jwt>
+   │
+   ▼ BearerTokenAuthenticationFilter
+   ▼ JwtDecoder: signature valid (HS256 secret)? not expired? issuer = "meterly"?   ── no → 401
+   ▼ JwtAuthenticationConverter: claim roles ["READER"] → authority ROLE_READER
+   ▼ authorizeHttpRequests: URL rule, e.g. GET /api/accounts/*/cost needs READER or ADMIN ── no → 403
+   ▼ @PreAuthorize("@access.canRead(authentication, #accountId)"): own account?          ── no → 403
+   ▼ controller method
+```
+
+### Key code
+
+| Code | Meaning |
+|------|---------|
+| `SecurityFilterChain` bean | The security rules for all HTTP requests |
+| `csrf.disable()` + `STATELESS` | No cookies or sessions; the token travels with every request, so CSRF attacks don't apply |
+| `.requestMatchers(POST, "/api/usage").hasAnyRole("WRITER","ADMIN")` | URL-level rule; **first matching rule wins**, so order matters |
+| `.anyRequest().hasRole("ADMIN")` | Deny-by-default: anything not listed is admin-only |
+| `oauth2ResourceServer(o -> o.jwt(...))` | "This API accepts JWT bearer tokens" |
+| `NimbusJwtDecoder.withSecretKey(key)` | Verifies the HMAC signature with our secret |
+| `JwtValidators.createDefaultWithIssuer("meterly")` | Also checks the `exp`/`nbf` times and the `iss` claim |
+| `@EnableMethodSecurity` + `@PreAuthorize("...")` | A rule on a single method, written in SpEL; `#accountId` = the method parameter, `@access` = the bean named "access" |
+| `@ConfigurationProperties(prefix="meterly.security")` record | Typed settings; `users.client.account-id` → `users.get("client").accountId()` |
+| `${METERLY_JWT_SECRET:dev-only...}` | Use an environment variable if set, else the dev default |
+| `MessageDigest.isEqual(a, b)` | Constant-time comparison (no timing leak) |
+| `@ConditionalOnProperty(...)` on `DemoDataLoader` | The bean only exists when the property is `true` (tests set it to `false`) |
+| `ApplicationRunner` | Code that runs once after the app has started |
+
+### 401 vs 403
+- **401 Unauthorized** = "I don't know who you are": the token is missing, invalid or expired.
+- **403 Forbidden** = "I know who you are, but you're not allowed to do this."
+
+### Production notes
+- Tokens would come from an identity provider (Keycloak/Auth0/Okta). Only `jwt-secret` → `spring.security.oauth2.resourceserver.jwt.issuer-uri` changes (RS256 public keys via JWKS); the URL rules and `@PreAuthorize` stay the same.
+- `/api/auth/token` and the demo users would be removed.
+
+### Interview Q&A
+- **What's in a JWT?** `header.payload.signature`, each Base64URL-encoded. The payload (claims) is **readable by anyone**: it's signed, not encrypted. Never put secrets in it.
+- **HS256 vs RS256?** HS256: one shared secret signs and verifies. RS256: a private key signs, a public key verifies, so many services can verify without being able to issue tokens.
+- **How do you revoke a JWT?** Short lifetimes + refresh tokens, or a deny-list. Stateless tokens can't simply be "logged out".
+- **URL rules vs `@PreAuthorize`?** URL rules for coarse role checks; method security for data-dependent rules (whose account is it?).
