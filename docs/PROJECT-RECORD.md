@@ -856,3 +856,62 @@ Log in as `client/client123` (customer view of Acme Corp) or `admin/admin123` (a
 | Run everything in Docker (no portal) | `docker compose --profile app up -d --build` |
 | Run all tests | `.\mvnw test` (integration tests need Docker running) |
 | Reset the database (deletes all data) | `docker compose down -v` then `docker compose up -d` |
+
+---
+
+## Step 12.1 — Real logins, part 1: the `app_user` table
+
+**Goal:** stop using the fake demo users in `application.properties` and keep real users in the database,
+so people can sign up. This part adds only the table; the Java code comes in the next part.
+
+### How it was added
+One new file: `src/main/resources/db/migration/V4__app_user.sql`. Flyway applied it automatically on the
+next startup ("Successfully applied 1 migration ... now at version v4"). No other file changed.
+
+### The columns
+
+| Column | Type | Why |
+|--------|------|-----|
+| `id` | BIGSERIAL | The database hands out the numbers |
+| `username` | VARCHAR(50) **UNIQUE** | Two people can't take the same username; the database guarantees it, not Java |
+| `password_hash` | VARCHAR(100) | **Only the BCrypt hash**, e.g. `$2a$10$N9qo8uLO…` (60 chars). The real password is never stored |
+| `role` | VARCHAR(20) + CHECK | Must be ADMIN, WRITER or READER. A typo like 'RADER' is rejected |
+| `account_id` | BIGINT, nullable, FK → account | Which account a customer may see |
+| `created_at` | TIMESTAMPTZ | When the user signed up |
+
+### The `reader_has_account` rule
+```sql
+CHECK ((role = 'READER' AND account_id IS NOT NULL)
+    OR (role <> 'READER' AND account_id IS NULL))
+```
+A READER is a customer, so they must point at exactly one account: the only one they may see.
+ADMIN and WRITER aren't tied to a single account, so theirs must be empty. Putting this in the database means
+no bug in any future version of the app can create a customer who sees nothing, or an admin tied to one account.
+
+**Proof it works** (tried by hand in psql):
+```
+insert into app_user (username, password_hash, role) values ('bad','x','READER');
+ERROR: new row for relation "app_user" violates check constraint "reader_has_account"
+```
+
+### Key ideas
+
+| Idea | Meaning |
+|------|---------|
+| Never store passwords | Store a one-way **hash**. Even someone who steals the database can't read the passwords |
+| BCrypt | A deliberately *slow* hash with a built-in random "salt", so guessing is expensive and two identical passwords get different hashes |
+| Constraints in the database | UNIQUE, CHECK and foreign keys are enforced for every writer, including psql and future code |
+| Never edit an applied migration | `V1`–`V3` are already applied, so a change goes in a **new** file (`V4`) |
+
+### Interview Q&A
+- **Why hash and not encrypt passwords?** Encryption can be reversed with the key; hashing can't. Nobody, including us, ever needs to read the original password: at login we hash what was typed and compare hashes.
+- **What is a salt?** Random data mixed into the hash, so identical passwords produce different hashes and precomputed "rainbow tables" don't work. BCrypt stores the salt inside the hash string.
+- **Why 100 characters for a 60-character hash?** Room for a future, longer algorithm without another migration.
+
+### Next in this series
+1. ✅ `app_user` table (this part)
+2. ⏳ Sign-up + login read/write the table; passwords hashed with BCrypt
+3. ⏳ Tests
+4. ⏳ Portal: Sign in / Sign up page
+5. ⏳ Portal: tabs depend on the role
+6. ⏳ Delete the demo users from `application.properties`
